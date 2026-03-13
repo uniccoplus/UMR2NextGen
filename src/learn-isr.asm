@@ -9,8 +9,17 @@
 ;
 ; Interrupt service routines for "learning" about host key matrix
 ;
-		list p=16F1939
-		#include	<p16f1939.inc>
+; [PIC16F18877] 変更点一覧:
+;	1. list/include: 16F1939 → 16F18877
+;	2. 受信割込みフラグ: PIR1,RCIF → PIR3,RC1IF
+;	3. 受信レジスタ: RCREG → RC1REG
+;	4. 受信割込み許可/禁止: PIE1,RCIE → PIE3,RC1IE
+;	5. Timer0割込みフラグ:
+;		旧: INTCON,TMR0IF (INTCONのbit2)
+;		新: PIR0,TMR0IF	(PIR0のbit5)
+
+		list p=16F18877			 ; [PIC16F18877]
+		#include <p16f18877.inc>	; [PIC16F18877]
 		#include	<umr2.inc>
 
 ; ==================================================================
@@ -32,11 +41,17 @@ isr_learn
 		clrf	BSR
 
 ; Check for serial receive
-		btfsc	PIR1,RCIF
+; [PIC16F18877] USART受信割込みチェック
+; 旧: btfsc PIR1,RCIF
+; 新: btfsc PIR3,RC1IF
+		btfsc	PIR3,RC1IF			; [PIC16F18877] PIR1,RCIF → PIR3,RC1IF
 		goto	handle_rx_learn
 
 ; Check for timer0 expiry
-		btfsc	INTCON,TMR0IF
+; [PIC16F18877] Timer0割込みチェック
+; 旧: btfsc INTCON,TMR0IF
+; 新: btfsc PIR0,TMR0IF
+		btfsc	PIR0,TMR0IF		 ; [PIC16F18877] INTCON,TMR0IF → PIR0,TMR0IF
 		goto	handle_timer_0_learn
 
 		retfie
@@ -50,8 +65,9 @@ isr_learn
 handle_rx_learn
 
 ; Grab the incoming byte
-		banksel	RCREG
-		movfw	RCREG
+; [PIC16F18877] 受信データ取得
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877] RCREG → RC1REG
 		movwf	TEMP_ISR
 		banksel	PORTA
 ; Check if first note has been received yet.
@@ -59,8 +75,11 @@ handle_rx_learn
 		goto	handle_rx_learn_process
 
 ; shut down the RX
-		banksel	PIE1
-		bcf	PIE1,RCIE
+; [PIC16F18877] 受信割込み無効化
+; 旧: banksel PIE1 / bcf PIE1,RCIE
+; 新: banksel PIE3 / bcf PIE3,RC1IE
+		banksel PIE3				; [PIC16F18877]
+		bcf	 PIE3,RC1IE			; [PIC16F18877] PIE1,RCIE → PIE3,RC1IE
 		retfie
 
 handle_rx_learn_process
@@ -89,7 +108,7 @@ ignore_message_learn
 flag_note_on_learn
 		movlw	NOTE_ON
 		movwf	MESSAGE_TYPE
-; store note-on status.  We'll use channel later.
+; store note-on status.	We'll use channel later.
 		movfw	TEMP_ISR
 		movwf	NOTE_ON_STATUS
 ; reset byte count
@@ -101,7 +120,7 @@ process_data_byte_learn
 		btfss	STATE_FLAGS,1
 		goto	store_d0_learn
 
-; second data byte.  reset byte count and check for relevant status
+; second data byte.	reset byte count and check for relevant status
 		bcf	STATE_FLAGS,1
 ; ignore data for message other than note on
 		btfsc	MESSAGE_TYPE,1
@@ -142,7 +161,10 @@ process_note_on_learn
 
 handle_timer_0_learn
 ; blinking STBY LED stuff
-		bcf	INTCON,TMR0IF
+; [PIC16F18877] Timer0フラグクリア
+; 旧: bcf INTCON,TMR0IF
+; 新: bcf PIR0,TMR0IF
+		bcf	 PIR0,TMR0IF		 ; [PIC16F18877] INTCON,TMR0IF → PIR0,TMR0IF
 		decfsz	COUNTER_T0,f
 		retfie
 

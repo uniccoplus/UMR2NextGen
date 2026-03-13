@@ -9,9 +9,135 @@
 ;
 ; bootloader / firmware update over MIDI
 ;
-		list p=16F1939
-		#include	<p16f1939.inc>
-		#include	<umr2.inc>
+; [PIC16F18877] 変更点一覧:
+;	1. list/include: 16F1939 → 16F18877
+;	2. 受信割込みフラグ: PIR1,RCIF → PIR3,RC1IF
+;	3. 受信レジスタ: RCREG → RC1REG
+;	4. NVMレジスタ全面変更 (checksum.asmと同様)
+;	5. ★重要★ プログラムFlash/EEPROM選択論理反転:
+;		bcf NVMCON1,NVMREGS = プログラムFlash
+;		bsf NVMCON1,NVMREGS = データEEPROM
+;	6. 送受信バッファクリア時: PIR1,RCIF→PIR3,RC1IF, RCSTA→RC1STA
+;
+; ============================================================
+; MIDIファームウェアアップデート SysExプロトコル仕様
+; ============================================================
+;
+; 【起動方法】
+;	電源OFF → PRGM0ボタン(PORTA,5)を押しながら電源ON
+;	→ PRGMボタンを押したまま: ファームウェア更新モード待機
+;	→ PRGMボタンを離す: ラーンモードへ移行
+;
+; 【SysExメッセージ全体構造】
+;	F0	[ヘッダ4byte]	[フィラー/チャンク×N]	F7
+;
+; 【ヘッダ (F0の直後、4 bytes)】
+;	00	マニュファクチャID byte1
+;	01	マニュファクチャID byte2
+;	5D	マニュファクチャID byte3
+;	07	プロダクトID
+;	※ヘッダ不一致 → エラー(LED点滅)
+;
+; 【フィラーバイト】
+;	00	無視される。チャンク間の区切りに使用可。
+;
+; 【チャンク種別マーカー(ヘッダ確認後)】
+;	7E	コードチャンク開始
+;	7F	チェックサムチャンク開始
+;
+; ============================================================
+; コードチャンク形式 (7E の直後)
+; ============================================================
+; 1チャンク = プログラムFlash 32word(64byte)ブロック
+; アドレスは32word境界にアライメントすること
+;
+; ---- アドレス部 (4 bytes) ----
+;	addr_lo	= address[6:0]			(7bit, MSB=0)
+;	chk_lo	= (~addr_lo) & 0x7F	 チェックバイト
+;	addr_hi	= address[13:7]		 (7bit, MSB=0)
+;	chk_hi	= (~addr_hi) & 0x7F	 チェックバイト
+;
+;	実アドレス復元:
+;	 real_addr[6:0]	= addr_lo
+;	 real_addr[13:7] = addr_hi
+;
+;	チェック式: data_byte + 0x80 + check_byte + 1 = 0 (mod 256)
+;
+; ---- オペコード部 (32word × 4bytes = 128 bytes) ----
+;	各14bitオペコードを4byteMIDIデータで送信:
+;	 Byte A: munged_lo & 0x7F	 (難読化済みオペコード下位)
+;	 Byte B: (~Byte_A) & 0x7F	チェックバイト
+;	 Byte C: munged_hi & 0x7F	(難読化済みオペコード上位)
+;	 Byte D: (~Byte_C) & 0x7F	チェックバイト
+;
+; ---- オペコード難読化(Munging)仕様 ----
+; オペコードカウンタ(0-3のサイクル, TEMP_3 bits[1:0])で変化:
+;
+;	ビット操作命令判定: op_hi bits[5:4] == 01 の場合
+;	(かつ op_hi != 0x00, op_hi != 0x01 の例外あり)
+;	op_hi XOR値:
+;	 カウンタ=0: XOR 0x09
+;	 カウンタ=1: XOR 0x02
+;	 カウンタ=2: XOR 0x0E
+;	 カウンタ=3: XOR 0x05
+;
+;	op_lo XOR値 (全命令共通):
+;	 カウンタ=0: XOR 0x1B
+;	 カウンタ=1: XOR 0x21
+;	 カウンタ=2: XOR 0x07
+;	 カウンタ=3: XOR 0x32
+;
+;	例外1: op_hi == 0x00	→ op_hiへのXOR不要
+;	例外2: op_hi == 0x01 かつ op_lo == 0x00 (CLRW命令) → op_hiへのXOR不要
+;
+; ============================================================
+; チェックサムチャンク形式 (7F の直後)
+; ============================================================
+; 全コードチャンク送信後に1回だけ送信する
+; 16bitチェックサム = 0x0000-0x1FFFの全opcodeバイトの和
+;
+; 16bitチェックサムの7bitMIDIエンコード (3バイト×2 = 6bytes):
+;	sum_lo	= checksum[6:0]			bits 6-0
+;	sum_mid = checksum[13:7]		 bits 13-7
+;	sum_hi	= checksum[15:14]		bits 1-0のみ有効
+;
+;	Byte 1: sum_lo					(7bit)
+;	Byte 2: (~sum_lo) & 0x7F		 チェック
+;	Byte 3: sum_mid					(7bit)
+;	Byte 4: (~sum_mid) & 0x7F		チェック
+;	Byte 5: sum_hi					(7bit, bit1:0のみ有効)
+;	Byte 6: (~sum_hi) & 0x7F		 チェック
+;	Byte 7: version					(7bit, ファームウェアバージョン番号)
+;	Byte 8: (~version) & 0x7F		チェック
+;
+; チェックサムチャンク受信完了後:
+;	→ チェックサム + バージョンをデータEEPROMに書き込み
+;	→ LED消灯して電源サイクル待ち(無限ループ)
+;
+; ============================================================
+; 完全なメッセージ例
+; ============================================================
+;	F0 00 01 5D 07			SysExヘッダ
+;	7E						コードチャンク開始
+;	AL AC AH AHC			アドレス(低/チェック/高/チェック)
+;	[OL OC OH OHC] × 32	オペコード×32 (各4byte)
+;	00						フィラー(省略可)
+;	7E						次のコードチャンク
+;	...					 (全ブロック分繰り返し)
+;	7F						チェックサムチャンク開始
+;	SL SC SM SMC SH SHC V VC	チェックサム+バージョン(8byte)
+;	F7						SysEx終了
+;
+; ============================================================
+; エラー処理
+; ============================================================
+;	チェックバイト不一致 or ヘッダ不一致 → エラーモード(LED点滅)
+;	電源サイクルで再試行可能
+; ============================================================
+
+		list p=16F18877			 ; [PIC16F18877]
+		#include <p16f18877.inc>	; [PIC16F18877]
+		#include <umr2.inc>
 ; =================================
 ;
 ; Firmware Update ISR
@@ -42,33 +168,37 @@ isr_fupdate
 		clrf	BSR
 ;		clrf	PCLATH
 ; check for RX interrupt
-		btfsc	PIR1,RCIF
+; 旧: btfsc PIR1,RCIF
+; 新: btfsc PIR3,RC1IF (EUSARTがPIR1からPIR3へ移動)
+		btfsc	PIR3,RC1IF			; [PIC16F18877] PIR1,RCIF → PIR3,RC1IF
 		goto	fupdate_handle_rx
+
 ; no other interrupts should be on!
 		goto	fupdate_sysex_error
 
 
 fupdate_handle_rx
 ; Grab the RX byte
-		banksel	RCREG
-		movfw	RCREG
-;		movwf	TXREG
+; 旧: banksel RCREG / movfw RCREG
+; 新: banksel RC1REG / movfw RC1REG
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877] RCREG → RC1REG
 		movwf	TEMP
 		clrf	BSR
 
 ;		retfie
 
-; is SysEx begin?
+; is SysEx begin(0xF0)?
 		movlw	0xF0
 		subwf	TEMP,w
 		bz		fupdate_sysex_begin
 
-; is SysEx end?
+; is SysEx end (0xF7)?
 		movlw	0xF7
 		subwf	TEMP,w
 		bz		fupdate_sysex_end
 
-; real time status (ignored)?
+; real time status (0xF8-0xFF ignored)?
 		movfw	TEMP
 		andlw	B'11111000'
 		sublw	B'11111000'
@@ -95,7 +225,7 @@ fupdate_check
 fupdate_check_1
 		decfsz	TEMP_2,f
 		goto	fupdate_check_2
-		movlw	0x00
+		movlw	0x00				; Byte1: マニュファクチャID 0x00
 		subwf	TEMP,w
 		bnz		fupdate_sysex_error
 		goto	fupdate_isr_finish
@@ -103,7 +233,7 @@ fupdate_check_1
 fupdate_check_2
 		decfsz	TEMP_2,f
 		goto	fupdate_check_3
-		movlw	0x01
+		movlw	0x01				; Byte2: マニュファクチャID 0x01
 		subwf	TEMP,w
 		bnz		fupdate_sysex_error
 		goto	fupdate_isr_finish
@@ -111,7 +241,7 @@ fupdate_check_2
 fupdate_check_3
 		decfsz	TEMP_2,f
 		goto	fupdate_check_4
-		movlw	0x5D
+		movlw	0x5D				; Byte3: マニュファクチャID 0x5D
 		subwf	TEMP,w
 		bnz		fupdate_sysex_error
 		goto	fupdate_isr_finish
@@ -119,11 +249,11 @@ fupdate_check_3
 fupdate_check_4
 		decfsz	TEMP_2,f
 		goto	fupdate_sysex_error
-		movlw	0x07
+		movlw	0x07				; Byte4: プロダクトID 0x07
 		subwf	TEMP,w
 		bnz		fupdate_sysex_error
 ; header now relevant
-		bsf		STATE_FLAGS,1
+		bsf		STATE_FLAGS,1		; ヘッダ確認済みセット
 ; reset bytecount
 		clrf	BYTE_COUNT
 		goto	fupdate_isr_finish
@@ -132,9 +262,9 @@ fupdate_sysex_begin
 ; new message
 		clrf	BYTE_COUNT
 ; incomplete
-		bsf		STATE_FLAGS,0
+		bsf		STATE_FLAGS,0		; 受信中フラグセット
 ; not yet relevant
-		bcf		STATE_FLAGS,1
+		bcf		STATE_FLAGS,1		; ヘッダ未確認
 		goto	fupdate_isr_finish
 
 fupdate_get_data
@@ -262,50 +392,54 @@ fg_sum_8
 		btfsc	INTCON,GIE
 		goto	$-2
 ; make sure any writes are complete
-		banksel	EECON1
-		btfsc	EECON1,WR
+; [PIC16F18877] NVM書き込み完了待ち
+		banksel NVMCON1			 ; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877] EECON1,WR → NVMCON1,WR
 		goto	$-1
 ; write version
+		clrf	NVMADRH				; clear[PIC16F18877]
 		movfw	TEMP_7
-		movwf	EEDATL
+		movwf	NVMDATL			 ; [PIC16F18877] EEDATL → NVMDATL
 		movlw	PROM_VERSION
-		movwf	EEADRL
-		bcf		EECON1,EEPGD
-		bsf		EECON1,WREN
+		movwf	NVMADRL			 ; [PIC16F18877] EEADRL → NVMADRL
+; [PIC16F18877] データEEPROM選択: bsf NVMCON1,NVMREGS (1=EEPROM)
+; 旧: bcf EECON1,EEPGD ← ★論理反転
+		bsf	 NVMCON1,NVMREGS	 ; [PIC16F18877] ★論理反転
+		bsf	 NVMCON1,WREN		; [PIC16F18877] EECON1,WREN → NVMCON1,WREN
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2			 ; [PIC16F18877] EECON2 → NVMCON2
 		movlw	0xAA
-		movwf	EECON2
-		bsf		EECON1,WR
+		movwf	NVMCON2			 ; [PIC16F18877]
+		bsf	 NVMCON1,WR			; [PIC16F18877]
 ; make sure any writes are complete
-		btfsc	EECON1,WR
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; write high byte
 		movfw	TEMP_6
-		movwf	EEDATL
-		incf	EEADRL,f
-		bsf		EECON1,WREN
+		movwf	NVMDATL			 ; [PIC16F18877]
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf	 NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2			 ; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf		EECON1,WR
+		movwf	NVMCON2			 ; [PIC16F18877]
+		bsf	 NVMCON1,WR			; [PIC16F18877]
 ; make sure any writes are complete
-		btfsc	EECON1,WR
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; write low byte
 		movfw	TEMP_4
-		movwf	EEDATL
-		incf	EEADRL,f
-		bcf		EECON1,EEPGD
-		bsf		EECON1,WREN
+		movwf	NVMDATL			 ; [PIC16F18877]
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf	 NVMCON1,NVMREGS	 ; [PIC16F18877]
+		bsf	 NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2			 ; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf		EECON1,WR
+		movwf	NVMCON2			 ; [PIC16F18877]
+		bsf	 NVMCON1,WR			; [PIC16F18877]
 ; make sure any writes are complete
-		btfsc	EECON1,WR
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; shut off activity LED and wait for user to power cycle
 		clrf	BSR
@@ -351,7 +485,7 @@ fg_code_4
 		addwf	TEMP,f
 		incfsz	TEMP,f
 		goto	fupdate_sysex_error
-; change address from 7:7 to 6:8
+; change address from 7:7bit to 6:8bit
 		btfsc	TEMP_7,0
 		bsf		TEMP_6,7
 		bcf		STATUS,C
@@ -397,7 +531,7 @@ fg_code_8
 		incfsz	TEMP,f
 		goto	fupdate_sysex_error
 ; ok--munged opcode is now TEMP_4(7) : TEMP_5 (7)
-; change from 7:7 to 6:8
+; change from 7:7bit to 6:8bit
 		btfsc	TEMP_4,0
 		bsf		TEMP_5,7
 		bcf		STATUS,C
@@ -408,21 +542,22 @@ fg_code_8
 		bnz		demunge_check_clrw
 ; high byte is zero--
 ; no operations necessary.
-		goto	fg_code_store
+		goto	fg_code_store		; op_hi == 0: 難読化なし
 
-; clrw   (1 0000 0000)
+; clrw	(1 0000 0000)
 demunge_check_clrw
 		movfw	TEMP_4
 		sublw	0x01
 		bnz		demunge_bit_oriented
 		movfw	TEMP_5
-		bz		fg_code_store
+		bz		fg_code_store		; CLRW命令: 難読化なし
 
 ; de-munge the bit-oriented opcodes
 ; use the opcode counter to cycle modifications
 demunge_bit_oriented
 ; bit oriented instructions are 01 iibb bfff ffff
 ; check for the 01
+; ビット操作命令 (op_hi bits[5:4] == 01) の上位バイトXOR
 		movfw	TEMP_4
 		andlw	B'00110000'
 		sublw	B'00010000'
@@ -481,7 +616,7 @@ demunge_reg_lit_11
 
 
 fg_code_store
-; store opcode low byte in buffer
+; store opcode low byte in RAM buffer(FIRMWARE_BUFFER)
 		clrf	FSR0H
 		movlw	FIRMWARE_BUFFER
 		movwf	FSR0L
@@ -490,7 +625,7 @@ fg_code_store
 		addwf	FSR0L,f
 		movfw	TEMP_5
 		movwf	INDF0
-; store opcode high byte in buffer
+; store opcode high byte in RAM buffer(FIRMWARE_BUFFER)
 		incf	FSR0L,f
 		movfw	TEMP_4
 		movwf	INDF0
@@ -517,23 +652,25 @@ fg_code_chunk_complete
 ;;;;
 ; erase EEPROM block before write
 ;;;;
-		banksel	EEADRH
+		banksel NVMADRH			 ; [PIC16F18877]
 		movfw	TEMP_7
-		movwf	EEADRH
+		movwf	NVMADRH			 ; [PIC16F18877] EEADRH → NVMADRH
 		movfw	TEMP_6
-		movwf	EEADRL
-		bsf		EECON1,EEPGD
-		bsf		EECON1,WREN
-		bsf		EECON1,FREE
+		movwf	NVMADRL			 ; [PIC16F18877] EEADRL → NVMADRL
+; [PIC16F18877] プログラムFlash選択: bcf NVMCON1,NVMREGS (0=Flash)
+; 旧: bsf EECON1,EEPGD ← ★論理反転
+		bcf	 NVMCON1,NVMREGS	 ; [PIC16F18877] ★論理反転
+		bsf	 NVMCON1,WREN		; [PIC16F18877]
+		bsf	 NVMCON1,FREE		; [PIC16F18877] Flash行消去モード
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2			 ; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf		EECON1,WR
+		movwf	NVMCON2			 ; [PIC16F18877]
+		bsf	 NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
-		bcf		EECON1,FREE
-		bcf		EECON1,WREN
+		bcf	 NVMCON1,FREE		; [PIC16F18877]
+		bcf	 NVMCON1,WREN		; [PIC16F18877]
 ;;;;
 ; write code to EEPROM
 ;;;;
@@ -541,56 +678,53 @@ fg_code_chunk_complete
 		clrf	FSR0H
 		movlw	FIRMWARE_BUFFER
 		movwf	FSR0L
-; EEADRH:EEADR point to program chunk to write
 		movfw	TEMP_7
-		movwf	EEADRH
+		movwf	NVMADRH			 ; [PIC16F18877]
 		movfw	TEMP_6
-		movwf	EEADRL
-; EECON1 stuff
-		bsf		EECON1,WREN
-; 32 words to write
+		movwf	NVMADRL			 ; [PIC16F18877]
+		bsf	 NVMCON1,WREN		; [PIC16F18877]
 		movlw	D'32'
 		movwf	TEMP
 fg_code_write_loop
-; set up the opcode
 		moviw	INDF0++
-		movwf	EEDATL
+		movwf	NVMDATL			 ; [PIC16F18877] EEDATL → NVMDATL
 		moviw	INDF0++
-		movwf	EEDATH
+		movwf	NVMDATH			 ; [PIC16F18877] EEDATH → NVMDATH
 ; clear LWLO only for last of groups of 8 words
-; ---> EEADRL[2:0] = B'111'
-		bsf		EECON1,LWLO
-		movf	EEADRL,w
+
+; LWLO bit位置: EECON1 bit5 → NVMCON1 bit6 (named bitで自動解決)
+		bsf	 NVMCON1,LWLO		; [PIC16F18877] ラッチ保持モード
+		movf	NVMADRL,w			; [PIC16F18877]
 		xorlw	0x07
 		andlw	0x07
 		btfsc	STATUS,Z
-		bcf		EECON1,LWLO
-fg_code_write_trigger
-; trigger the write
+		bcf	 NVMCON1,LWLO		; [PIC16F18877] 8word目でFlash書き込みトリガ
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2			 ; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf		EECON1,WR
+		movwf	NVMCON2			 ; [PIC16F18877]
+		bsf	 NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
-; next opcode
-		incf	EEADR,f
-; in aligned 32-word chunk, EEADRH is never incremented
+		incf	NVMADRL,f			; [PIC16F18877] EEADR → NVMADRL
 		decfsz	TEMP,f
 		goto	fg_code_write_loop
-		bcf		EECON1,WREN
+		bcf	 NVMCON1,WREN		; [PIC16F18877]
 
 fupdate_flush
 ; flush RX
-		banksel	RCREG
-		movfw	RCREG
-		movfw	RCREG
-		banksel	PIR1
-		bcf		PIR1,5
-		banksel	RCREG
-		bcf		RCSTA,4
-		bsf		RCSTA,4
+; 旧: banksel RCREG / movfw RCREG / movfw RCREG
+; 新: banksel RC1REG / movfw RC1REG / movfw RC1REG
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
+; [PIC16F18877] 受信割込みフラグクリア: PIR1,RCIF → PIR3,RC1IF (bit5→bit5)
+		banksel PIR3				; [PIC16F18877]
+		bcf	 PIR3,RC1IF			; [PIC16F18877] PIR1,RCIF → PIR3,RC1IF
+; [PIC16F18877] 受信器リセット: RCSTA → RC1STA
+		banksel RC1STA				; [PIC16F18877]
+		bcf	 RC1STA,CREN		 ; [PIC16F18877] RCSTA → RC1STA
+		bsf	 RC1STA,CREN		 ; [PIC16F18877]
 		clrf	BSR
 ; re-enable interrupts
 		bsf		INTCON,GIE
@@ -611,7 +745,7 @@ fupdate_sysex_end
 		clrf	BSR
 ; porta read-mod-write ok here
 ;		bsf		PORTA,0
-		goto	$-1
+		goto	$-1				 ; 無限ループ (エラー扱い)
 
 
 fupdate_sysex_error

@@ -100,5 +100,5 @@ SYSEX_HEADER_2		equ	0x5D
 ; Product ID
 SYSEX_HEADER_3		equ	0x07
 
-; Other
+; Timer Counter
 COUNTER_T0_MAX		equ	0x1F

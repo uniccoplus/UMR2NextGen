@@ -9,8 +9,22 @@
 ;
 ; Main program loop for "learning" host keyboard configuration
 ;
-		list p=16F1939
-		#include	<p16f1939.inc>
+; [PIC16F18877] 変更点一覧:
+;	1. list/include: 16F1939 → 16F18877
+;	2. Timer0割込み有効化:
+;		旧: movlw B'11100000' / movwf INTCON (GIE+PEIE+TMR0IE)
+;		新: movlw B'11000000' / movwf INTCON (GIE+PEIE)
+;			+ banksel PIE0 / bsf PIE0,TMR0IE (Timer0IEをPIE0で設定)
+;	3. 受信割込み: PIE1,RCIE → PIE3,RC1IE
+;	4. NVMレジスタ全面変更 (checksum.asmと同様)
+;	5. ★重要★ EEPROM選択論理反転:
+;		bsf NVMCON1,NVMREGS = データEEPROM
+;		bcf NVMCON1,NVMREGS = プログラムFlash
+;	6. RCSTA → RC1STA, RCREG → RC1REG
+;	7. 送信: PIR1,TXIF → PIR3,TX1IF, TXREG → TX1REG
+
+		list p=16F18877				; [PIC16F18877]
+		#include <p16f18877.inc>	; [PIC16F18877]
 		#include	<umr2.inc>
 
 ; =================================
@@ -29,7 +43,7 @@ start_learn
 ; =================================
 ;
 ; Configuration Report
-; Send config data via sysex.  Useful for debugging & customer support.
+; Send config data via sysex.	Useful for debugging & customer support.
 ;
 ; =================================
 
@@ -55,10 +69,16 @@ start_learn
 		movwf	PORTC
 ; enable Timer 0 so that STBY LED blinks.
 ; Enable Interrupts so the first note can be recorded.
+; [PIC16F18877] Timer0割込み有効化 + GIE/PEIE設定
+; 旧: movlw B'11100000' / movwf INTCON	(GIE+PEIE+TMR0IE一括)
+; 新: INTCONにGIE+PEIEのみ設定し、TMR0IEはPIE0で個別に設定
 		movlw	COUNTER_T0_MAX
 		movwf	COUNTER_T0
-		movlw	B'11100000'
+		movlw	B'11000000'			; [PIC16F18877] GIE+PEIE (TMR0IEはPIE0へ)
 		movwf	INTCON
+		banksel PIE0
+		bsf		PIE0,TMR0IE			; [PIC16F18877] Timer0割込み有効(INTCON→PIE0)
+		clrf	BSR
 
 ; flush out any rx errors
 		call	flush_rx_learn
@@ -73,8 +93,9 @@ wait_for_first_note
 		btfss	STATE_FLAGS,3
 		goto	wait_for_first_note
 ; disable MIDI receive
-		banksel	PIE1
-		bcf	PIE1,RCIE
+; [PIC16F18877] 受信割込み無効化: PIE1,RCIE → PIE3,RC1IE
+		banksel PIE3				; [PIC16F18877]
+		bcf		PIE3,RC1IE			; [PIC16F18877] PIE1,RCIE → PIE3,RC1IE
 		clrf	BSR
 ; disable interrupts
 		bcf	INTCON,GIE
@@ -85,41 +106,43 @@ wait_for_first_note
 		movlw	0x0F
 		andwf	NOTE_ON_STATUS,w
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877] EECON1,WR → NVMCON1,WR
 		goto	$-1
 ; write channel
-		movwf	EEDATL
+		movwf	NVMDATL				; [PIC16F18877] EEDATL → NVMDATL
 		movlw	PROM_CHANNEL
-		movwf	EEADRL
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		movwf	NVMADRL				; [PIC16F18877] EEADRL → NVMADRL
+; [PIC16F18877] データEEPROM選択: bsf NVMCON1,NVMREGS ← ★論理反転
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877] ★論理反転: bcf EEPGD → bsf NVMREGS
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877] EECON2 → NVMCON2
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
+
 ; store the first note number in data EEPROM
 		clrf	BSR
 		movfw	FIRST_NOTE
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; write first note
-		movwf	EEDATL
+		movwf	NVMDATL				; [PIC16F18877]
 		movlw	PROM_FIRST_NOTE
-		movwf	EEADRL
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		movwf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN			; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; make sure write is complete
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 		clrf	BSR
 
@@ -214,14 +237,14 @@ poll_default_keys_complete
 
 ; =================================
 ;
-; Monitor keystrokes.  For each, record select/data/note number
+; Monitor keystrokes.	For each, record select/data/note number
 ;
 ; =================================
 
 ; FSR1L is MIDI note number 0-127 for the next keystroke
 ;		movfw	FIRST_NOTE
 ;		movwf	FSR1L
-; start notes at location 0.  First note will be used as an offset
+; start notes at location 0.	First note will be used as an offset
 ; in runtime.
 		clrf	FSR1L
 
@@ -244,18 +267,18 @@ poll_setup_keystrokes
 		addwf	FSR0L,f
 		movfw	TEMP_3
 		xorwf	INDF0,w
-; no change?  do nothing.
+; no change?	do nothing.
 		bz	poll_setup_keystrokes
-; data state has changed.  store select and data states for current note.
+; data state has changed.	store select and data states for current note.
 ; put changed bit into TEMP_4
 		movwf	TEMP_4
-; rx map info.  3 bytes indexed by note number.
+; rx map info.	3 bytes indexed by note number.
 ; select low
 		movlw	0x21
 		movwf	FSR1H
 		movfw	TEMP
 		movwf	INDF1
-; select high.  add in base address for normal operation
+; select high.	add in base address for normal operation
 		incf	FSR1H,f
 		movfw	TEMP_2
 		andlw	B'00000001'
@@ -265,7 +288,7 @@ poll_setup_keystrokes
 		incf	FSR1H,f
 		movfw	TEMP_4
 		movwf	INDF1
-; tx map info.  one byte indexed by select 1-12 x data 1-8
+; tx map info.	one byte indexed by select 1-12 x data 1-8
 		movlw	0x20
 		movwf	FSR0H
 		movlw	0x80
@@ -333,7 +356,7 @@ store_tx_map_note
 ; move the current note number in FSR1L (not INDF1!) into tx map
 		movfw	FSR1L
 		movwf	INDF0
-; advance to next note.  wrap at 128.
+; advance to next note.	wrap at 128.
 		incf	FSR1L,f
 		movlw	B'01111111'
 		andwf	FSR1L,f
@@ -383,52 +406,53 @@ setup_write_loop
 
 ; write the note count
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
-; write the note count.  Limit to 7 bits.
+; write the note count.	Limit to 7 bits.
+		clrf	NVMADRH				; clear[PIC16F18877]
 		movfw	FSR1L
 		andlw	B'01111111'
-		movwf	EEDATL
+		movwf	NVMDATL				; [PIC16F18877]
 		movlw	PROM_NOTE_COUNT
-		movwf	EEADRL
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		movwf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; write the setup completion flag
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; write setup count
-; increment the previous value by one.  Limit to 7 bits.
+; increment the previous value by one.	Limit to 7 bits.
 		clrf	BSR
 		incf	SETUP_COUNT,w
 		andlw	B'01111111'
-		banksel	EEDATL
-		movwf	EEDATL
+		banksel	NVMDATL				; [PIC16F18877]
+		movwf	NVMDATL				; [PIC16F18877]
 		movlw	PROM_SETUP_COUNT
-		movwf	EEADRL
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		movwf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; make sure write is complete
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 		clrf	BSR
 
-; Send config data via sysex.  Useful for debugging & customer support.
+; Send config data via sysex.	Useful for debugging & customer support.
 		call	send_sysex_config
-; all done.  shut down.
+; all done.	shut down.
 ; wait for a sec
 		call	blink_delay_learn
 		call	blink_delay_learn
@@ -493,7 +517,7 @@ blink_loop_c_learn
 ;
 ; take a snapshot of select and data lines
 ; select in TEMP_2:TEMP
-;   data in        TEMP_3
+;	data in		TEMP_3
 ;
 ; =================================
 take_snapshot_learn
@@ -596,13 +620,14 @@ point_to_key_data_learn
 ; =================================
 flush_rx_learn
 ; Flush the FIFO
-		banksel	RCREG
-		movfw	RCREG
-		movfw	RCREG
+; [PIC16F18877] RCREG → RC1REG, RCSTA → RC1STA
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
 ; Flush out any bytes & errors sitting around
-		banksel	RCSTA
-		bcf	RCSTA,4
-		bsf	RCSTA,4
+		banksel	RC1STA				; [PIC16F18877]
+		bcf		RC1STA,CREN			; [PIC16F18877] RCSTA → RC1STA
+		bsf		RC1STA,CREN			; [PIC16F18877]
 		clrf	BSR
 
 		return
@@ -620,60 +645,62 @@ write_32_learn
 		movfw	TEMP_4
 		movwf	FSR0L
 ; erase EEPROM block before write
-		banksel	EEADRH
+; [PIC16F18877] Flashブロック消去
+		banksel NVMADRH				; [PIC16F18877]
 		movfw	TEMP_7
-		movwf	EEADRH
+		movwf	NVMADRH				; [PIC16F18877]
 		movfw	TEMP_6
-		movwf	EEADRL
-		bsf	EECON1,EEPGD
-		bsf	EECON1,WREN
-		bsf	EECON1,FREE
+		movwf	NVMADRL				; [PIC16F18877]
+; [PIC16F18877] プログラムFlash選択: bcf NVMCON1,NVMREGS ← ★論理反転
+		bcf		NVMCON1,NVMREGS		; [PIC16F18877] ★論理反転
+		bsf		NVMCON1,WREN		; [PIC16F18877]
+		bsf		NVMCON1,FREE		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
-		bcf	EECON1,FREE
-		bcf	EECON1,WREN
+		bcf		NVMCON1,FREE		; [PIC16F18877]
+		bcf		NVMCON1,WREN		; [PIC16F18877]
 ; write EEPROM block
 ; EEADRH:EEADRL points to program EEPROM
 		movfw	TEMP_7
-		movwf	EEADRH
+		movwf	NVMADRH				; [PIC16F18877]
 		movfw	TEMP_6
-		movwf	EEADRL
+		movwf	NVMADRL				; [PIC16F18877]
 ; EECON1 stuff
-		bsf	EECON1,WREN
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 ; 32 words to write
 		movlw	D'32'
 		movwf	TEMP
 write_buffer_learn_loop
-; we're only using the low byte for storage.  clear the high byte.
+; we're only using the low byte for storage.	clear the high byte.
 		moviw	INDF0++
-		movwf	EEDATL
-		clrf	EEDATH
+		movwf	NVMDATL				; [PIC16F18877]
+		clrf	NVMDATH				; [PIC16F18877] 上位バイトは0
 ; clear LWLO only for last of groups of 8 words
 ; ---> EEADRL[2:0] = B'111'
-		bsf	EECON1,LWLO
-		movf	EEADRL,w
+		bsf		NVMCON1,LWLO		; [PIC16F18877]
+		movf	NVMADRL,w			; [PIC16F18877]
 		xorlw	0x07
 		andlw	0x07
 		btfsc	STATUS,Z
-		bcf	EECON1,LWLO
+		bcf		NVMCON1,LWLO		; [PIC16F18877]
 ; trigger the write
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
 ; next word
-		incf	EEADR,f
+		incf	NVMADRL,f			; [PIC16F18877]
 		decfsz	TEMP,f
 		goto	write_buffer_learn_loop
-		bcf	EECON1,WREN
+		bcf		NVMCON1,WREN		; [PIC16F18877]
 
 		clrf	BSR
 
@@ -688,61 +715,62 @@ write_buffer_learn_loop
 ; =================================
 fill_32_learn
 ; erase EEPROM block before write
-		banksel	EEADRH
+		banksel	NVMADRH				; [PIC16F18877]
 		movfw	TEMP_6
-		movwf	EEADRH
+		movwf	NVMADRH				; [PIC16F18877]
 		movfw	TEMP_5
-		movwf	EEADRL
-		bsf	EECON1,EEPGD
-		bsf	EECON1,WREN
-		bsf	EECON1,FREE
+		movwf	NVMADRL				; [PIC16F18877]
+; [PIC16F18877] Flash選択 & 消去
+		bcf		NVMCON1,NVMREGS		; [PIC16F18877] ★論理反転
+		bsf		NVMCON1,WREN		; [PIC16F18877]
+		bsf		NVMCON1,FREE		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
-		bcf	EECON1,FREE
-		bcf	EECON1,WREN
+		bcf		NVMCON1,FREE		; [PIC16F18877]
+		bcf		NVMCON1,WREN		; [PIC16F18877]
 ; write EEPROM block
 ; EEADRH:EEADRL points to program EEPROM
 		movfw	TEMP_6
-		movwf	EEADRH
+		movwf	NVMADRH				; [PIC16F18877]
 		movfw	TEMP_5
-		movwf	EEADRL
+		movwf	NVMADRL				; [PIC16F18877]
 ; EECON1 stuff
-		bsf	EECON1,WREN
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 ; 16 words to write
 		movlw	D'32'
 		movwf	TEMP
 fill_buffer_learn_loop
-; we're only using the low byte for storage.  clear the high byte.
+; we're only using the low byte for storage.	clear the high byte.
 		movfw	TEMP_2
 ;		movfw	EEADRL
-		movwf	EEDATL
-		clrf	EEDATH
+		movwf	NVMDATL				; [PIC16F18877]
+		clrf	NVMDATH				; [PIC16F18877]
 ; clear LWLO only for last of groups of 8 words
 ; ---> EEADRL[2:0] = B'111'
-		bsf	EECON1,LWLO
-		movf	EEADRL,w
+		bsf		NVMCON1,LWLO		; [PIC16F18877]
+		movf	NVMADRL,w			; [PIC16F18877]
 		xorlw	0x07
 		andlw	0x07
 		btfsc	STATUS,Z
-		bcf	EECON1,LWLO
+		bcf		NVMCON1,LWLO		; [PIC16F18877]
 ; trigger the write
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 		nop
 		nop
 ; next word
-		incf	EEADR,f
+		incf	NVMADRL,f			; [PIC16F18877]
 		decfsz	TEMP,f
 		goto	fill_buffer_learn_loop
-		bcf	EECON1,WREN
+		bcf		NVMCON1,WREN		; [PIC16F18877]
 
 		clrf	BSR
 
@@ -755,33 +783,39 @@ fill_buffer_learn_loop
 ; =================================
 send_sysex_config
 ; grab bytes from data prom
-		banksel	EEADRL
-		bcf	EECON1,EEPGD
+		banksel	NVMADRL				; [PIC16F18877]
+		clrf	NVMADRH				; clear[PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877] データEEPROM選択
 ; version
-		clrf	EEADRL
-		bsf	EECON1,RD
-		movfw	EEDATL
+		clrf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL				; [PIC16F18877]
 		movwf	TEMP
 ; channel
 		movlw	PROM_CHANNEL
-		movwf	EEADRL
-		bsf	EECON1,RD
-		movfw	EEDATL
+		movwf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL				; [PIC16F18877]
 		movwf	TEMP_2
 ; first note
-		incf	EEADRL,f
-		bsf	EECON1,RD
-		movfw	EEDATL
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf		NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL				; [PIC16F18877]
 		movwf	TEMP_3
 ; note count
-		incf	EEADRL,f
-		bsf	EECON1,RD
-		movfw	EEDATL
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf		NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL				; [PIC16F18877]
 		movwf	TEMP_5
 ; setup complete flag
-		incf	EEADRL,f
-		bsf	EECON1,RD
-		movfw	EEDATL
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf		NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL				; [PIC16F18877]
 		movwf	TEMP_4
 		clrf	BSR
 ; send sysex header
@@ -832,10 +866,11 @@ send_sysex_config
 transmit_byte_learn
 		nop
 		nop
-		btfss	PIR1,TXIF
+; [PIC16F18877] 送信バッファ空き待ち: PIR1,TXIF → PIR3,TX1IF
+		btfss	PIR3,TX1IF			; [PIC16F18877] PIR1,TXIF → PIR3,TX1IF
 		goto	$-1
-		banksel	TXREG
-		movwf	TXREG
+		banksel	TX1REG				; [PIC16F18877]
+		movwf	TX1REG				; [PIC16F18877] TXREG → TX1REG
 		clrf	BSR
 		return
 
@@ -849,7 +884,7 @@ wipe_config
 ; first, the tx map
 		movlw	0xFF
 		movwf	TEMP_2
-		movlw	0x30
+		movlw	0x3C				; [PIC16F18877]
 		movwf	TEMP_6
 		clrf	TEMP_5
 wipe_config_loop_a
@@ -858,11 +893,11 @@ wipe_config_loop_a
 		addwf	TEMP_5,f
 		btfsc	STATUS,C
 		incf	TEMP_6,f
-; check for completion at PROM 0x3800
-		btfss	TEMP_6,3
+; check for completion at PROM 0x3D00
+		btfss	TEMP_6,0			; 0x3D(bit0=1)になったら終了[PIC16F18877]
 		goto	wipe_config_loop_a
 ; second, the rx map
-		clrf	TEMP
+		clrf	TEMP_2				; bug 2026.3.13 uniccoplus
 		movlw	0x3D
 		movwf	TEMP_6
 		clrf	TEMP_5
@@ -877,49 +912,50 @@ wipe_config_loop_b
 		goto	wipe_config_loop_b
 ; clear the data rom
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; wipe channel
-		clrf	EEDATL
+		clrf	NVMADRH				; clear[PIC16F18877]
+		clrf	NVMDATL				; [PIC16F18877]
 		movlw	PROM_CHANNEL
-		movwf	EEADRL
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		movwf	NVMADRL				; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; wipe first note
-		incf	EEADRL,f
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; make sure EEPROM is ready to go
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 ; wipe setup complete flag
-		incf	EEADRL,f
-		bcf	EECON1,EEPGD
-		bsf	EECON1,WREN
+		incf	NVMADRL,f			; [PIC16F18877]
+		bsf		NVMCON1,NVMREGS		; [PIC16F18877]
+		bsf		NVMCON1,WREN		; [PIC16F18877]
 		movlw	0x55
-		movwf	EECON2
+		movwf	NVMCON2				; [PIC16F18877]
 		movlw	0xAA
-		movwf	EECON2
-		bsf	EECON1,WR
+		movwf	NVMCON2				; [PIC16F18877]
+		bsf		NVMCON1,WR			; [PIC16F18877]
 ; make sure write is complete
-		banksel	EECON1
-		btfsc	EECON1,WR
+		banksel	NVMCON1				; [PIC16F18877]
+		btfsc	NVMCON1,WR			; [PIC16F18877]
 		goto	$-1
 		clrf	BSR
 

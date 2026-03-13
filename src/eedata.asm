@@ -9,8 +9,13 @@
 ;
 ; Data eeprom initial values
 ;
-		list p=16F1939
-		#include	<p16f1939.inc>
+; [PIC16F18877] 変更点:
+;  - list/include: 16F1939 → 16F18877
+;  - EEPROMデータ配置アドレス 0xF000 は同一
+;  - データ内容は元と同一
+
+		list p=16F18877			 ; [PIC16F18877]
+		#include <p16f18877.inc>	; [PIC16F18877]
 
 ; =================================
 ;
@@ -25,7 +30,7 @@ eedata code	0xF000
 ; Checksum
 		data	0x31
 		data	0x87
-; Channel
+; MIDI Channel
 		data	0x00
 ; First Note
 		data	0x00
@@ -33,7 +38,13 @@ eedata code	0xF000
 		data	0x00
 ; Setup Count
 		data	0x00
-; Reserved (248 bytes)
+; Reserved (249 bytes, 0x00)
+		data	0x00
+		data	0x00
+		data	0x00
+		data	0x00
+		data	0x00
+		data	0x00
 		data	0x00
 		data	0x00
 		data	0x00

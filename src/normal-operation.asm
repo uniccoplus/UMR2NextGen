@@ -9,8 +9,20 @@
 ;
 ; Main program loop
 ;
-		list p=16F1939
-		#include	<p16f1939.inc>
+; [PIC16F18877] 変更点一覧:
+;	1. list/include: 16F1939 → 16F18877
+;	2. NVMレジスタ全面変更 (checksum.asmと同様)
+;	3. ★重要★ EEPROM選択論理反転:
+;		bsf NVMCON1,NVMREGS = データEEPROM選択
+;	4. USART: RCSTA→RC1STA, RCREG→RC1REG, TXREG→TX1REG
+;	5. PIR1,TXIF → PIR3,TX1IF
+;	6. Timer0割込み:
+;		旧: bcf INTCON,TMR0IF / bsf INTCON,TMR0IE
+;		新: bcf PIR0,TMR0IF	/ bsf PIE0,TMR0IE
+;
+
+		list p=16F18877			 ; [PIC16F18877]
+		#include <p16f18877.inc>	; [PIC16F18877]
 		#include	<umr2.inc>
 
 ; =================================
@@ -38,26 +50,32 @@ start_normal
 	btfss	PORTA,4
 	bsf	STATE_FLAGS,4
 ; load channel and first note setting from data PROM.
-	banksel	EEADRL
-	movlw	PROM_CHANNEL
-	movwf	EEADRL
-	bcf	EECON1,EEPGD
-	bsf	EECON1,RD
+; [PIC16F18877] データEEPROMからチャンネル/ファーストノートを読み込み
+		banksel NVMADRL			 ; [PIC16F18877] EEADRL → NVMADRL
+		movlw	PROM_CHANNEL
+		movwf	NVMADRL			 ; [PIC16F18877]
+; [PIC16F18877] データEEPROM選択: bsf NVMCON1,NVMREGS (1=EEPROM)
+; 旧: bcf EECON1,EEPGD ← ★論理反転
+		bsf	 NVMCON1,NVMREGS	 ; [PIC16F18877] ★論理反転
+		bsf	 NVMCON1,RD			; [PIC16F18877] EECON1,RD → NVMCON1,RD
+		nop						 ; [PIC16F18877] EEPROM読み出し待ち
 ; store channel in TEMP
-	movfw	EEDATL
+	movfw	NVMDATL			 ; [PIC16F18877] EEDATL → NVMDATL (チャンネル)
 	movwf	TEMP
 ; store first note in TEMP_2
-	incf	EEADRL,f
-	bsf	EECON1,RD
-	movfw	EEDATL
+	incf	NVMADRL,f			; [PIC16F18877]
+		bsf	 NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL			 ; [PIC16F18877] (ファーストノート)
 	movwf	TEMP_2
 ; store setup flag in TEMP_3
-	incf	EEADRL,f
-	bsf	EECON1,RD
-	movfw	EEDATL
+	incf	NVMADRL,f			; [PIC16F18877]
+		bsf	 NVMCON1,RD			; [PIC16F18877]
+		nop
+		movfw	NVMDATL			 ; [PIC16F18877] (セットアップフラグ)
 	movwf	TEMP_3
 	clrf	BSR
-; init channel
+; init midi channel
 	movfw	TEMP
 	addlw	0x80
 	movwf	NOTE_OFF_STATUS
@@ -128,22 +146,24 @@ key_bit_wipe_loop2
 ; =================================
 
 ; Flush the FIFO
-		banksel	RCREG
-		movfw	RCREG
-		movfw	RCREG
+; [PIC16F18877] RXバッファフラッシュ
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877] RCREG → RC1REG
+		movfw	RC1REG				; [PIC16F18877]
 ; flush out any bytes & errors sitting around
-		banksel	RCSTA
-		bcf	RCSTA,CREN
+; [PIC16F18877] 受信エラークリア
+		banksel RC1STA				; [PIC16F18877]
+		bcf	 RC1STA,CREN		 ; [PIC16F18877] RCSTA → RC1STA
 ; if TX mode, leave RX disabled.
 		btfss	STATE_FLAGS,4
-		bsf	RCSTA,CREN
+		bsf	RC1STA,CREN		 ; [PIC16F18877]
 		clrf	BSR
 ; Flush more
-		banksel	RCREG
-		movfw	RCREG
-		movfw	RCREG
+		banksel RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
+		movfw	RC1REG				; [PIC16F18877]
 		clrf	BSR
-; Enable Interrupts
+; Enable Interrupts(GIE + PEIE)
 		movlw	B'11000000'
 		movwf	INTCON
 
@@ -158,7 +178,7 @@ key_bit_wipe_loop2
 ; check mode.
 		btfsc	STATE_FLAGS,4
 		goto	go_tx
-; check polarity.  If negative, we'll have to complement the select address.
+; check polarity.	If negative, we'll have to complement the select address.
 		btfsc	PORTC,5
 		goto	poll_rx_neg
 
@@ -257,16 +277,22 @@ groom_complete
 ; LED indication
 		clrf	PORTC
 		clrf	TMR0
-		bcf	INTCON,TMR0IF
-		bsf	INTCON,TMR0IE
+; [PIC16F18877] Timer0フラグクリア&割込み有効
+; 旧: bcf INTCON,TMR0IF / bsf INTCON,TMR0IE
+; 新: bcf PIR0,TMR0IF / bsf PIE0,TMR0IE
+		banksel PIR0
+		bcf	 PIR0,TMR0IF		 ; [PIC16F18877] INTCON,TMR0IF → PIR0,TMR0IF
+		banksel PIE0
+		bsf	 PIE0,TMR0IE		 ; [PIC16F18877] INTCON,TMR0IE → PIE0,TMR0IE
+		clrf	BSR
 ; internal note number is in INDF1
 ; put velocity in TEMP_5
-		movlw	0x7F
+		movlw	0x7F				; デフォルトベロシティ = 0x7F
 		movwf	TEMP_5
 		movfw	TEMP_4
 		andwf	TEMP_3,w
 		btfsc	STATUS,Z
-		clrf	TEMP_5
+		clrf	TEMP_5				; キーオフならベロシティ = 0
 		movfw	NOTE_ON_STATUS
 		call	transmit_byte_normal
 		movfw	INDF1
@@ -328,7 +354,10 @@ blink_loop_b
 ;
 ; take a snapshot of select and data lines
 ; select in TEMP_2:TEMP
-;   data in        TEMP_3
+;	data in		TEMP_3
+; TEMP	: セレクト 8-1 (PORTB)
+; TEMP_2 : セレクト 9	(PORTA)
+; TEMP_3 : データ 1-8	(PORTD)
 ;
 ; =================================
 take_snapshot_normal
@@ -425,7 +454,7 @@ point_to_key_data_normal
 		return
 
 point_to_tx_map_normal
-; tx map info.  one byte indexed by select 1-12 x data 1-8
+; tx map info.	one byte indexed by select 1-12 x data 1-8
 		movlw	0xBC
 		movwf	FSR1H
 		movlw	0x80
@@ -501,10 +530,13 @@ point_to_tx_map_data_normal
 transmit_byte_normal
 		nop
 		nop
-		btfss	PIR1,TXIF
+; [PIC16F18877] 送信レジスタ空き待ち
+; 旧: btfss PIR1,TXIF
+; 新: btfss PIR3,TX1IF (EUSARTがPIR1からPIR3へ移動)
+		btfss	PIR3,TX1IF			; [PIC16F18877] PIR1,TXIF → PIR3,TX1IF
 		goto	$-1
-		banksel	TXREG
-		movwf	TXREG
+		banksel TX1REG				; [PIC16F18877]
+		movwf	TX1REG				; [PIC16F18877] TXREG → TX1REG
 		clrf	BSR
 		return
 
